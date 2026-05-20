@@ -45,29 +45,38 @@ KPI_FEATURE_COLS = [
     "perc_reas", "earning_per_hour",
 ]
 
+# Columns for which week-over-week delta features are computed
+WOW_TREND_COLS = ["earning_per_hour", "cpo_local_currency", "net_cpo_lc"]
+
 BASE_LABELS = {
-    "no_shows":                    "No-shows",
-    "shifts_done":                 "Shifts done",
-    "all_shifts":                  "All shifts",
-    "hours_worked":                "Hours worked",
-    "perc_no_show":                "No-show %",
-    "total_orders_cpo":            "Orders (CPO)",
-    "total_bw_orders":             "BW orders",
-    "total_earnings":              "Total earnings",
-    "cpo_local_currency":          "CPO (LC)",
-    "net_cpo_lc":                  "Net CPO (LC)",
-    "perc_stacking":               "Stacking %",
-    "avg_sp_distance_google":      "SP dist (km)",
-    "avg_pd_distance_google":      "PD dist (km)",
-    "avg_total_distance_google":   "Total dist (km)",
-    "at_customer_time_in_minutes": "At-customer (min)",
-    "at_vendor_time_in_minutes":   "At-vendor (min)",
-    "cdt":                         "CDT (min)",
-    "perc_reas":                   "Reassignment %",
-    "earning_per_hour":            "Earnings/hour",
-    "tenure_days":                 "Tenure (days)",
-    "days_since_last_slot":        "Days since last slot",
-    "is_churned":                  "** CHURNED **",
+    "no_shows":                       "No-shows",
+    "shifts_done":                    "Shifts done",
+    "all_shifts":                     "All shifts",
+    "hours_worked":                   "Hours worked",
+    "perc_no_show":                   "No-show %",
+    "total_orders_cpo":               "Orders (CPO)",
+    "total_bw_orders":                "BW orders",
+    "total_earnings":                 "Total earnings",
+    "cpo_local_currency":             "CPO (LC)",
+    "net_cpo_lc":                     "Net CPO (LC)",
+    "perc_stacking":                  "Stacking %",
+    "avg_sp_distance_google":         "SP dist (km)",
+    "avg_pd_distance_google":         "PD dist (km)",
+    "avg_total_distance_google":      "Total dist (km)",
+    "at_customer_time_in_minutes":    "At-customer (min)",
+    "at_vendor_time_in_minutes":      "At-vendor (min)",
+    "cdt":                            "CDT (min)",
+    "perc_reas":                      "Reassignment %",
+    "earning_per_hour":               "Earnings/hour",
+    "earning_per_hour_delta_1w":      "Earnings/hour Δ1w",
+    "earning_per_hour_delta_2w":      "Earnings/hour Δ2w",
+    "cpo_local_currency_delta_1w":    "CPO (LC) Δ1w",
+    "cpo_local_currency_delta_2w":    "CPO (LC) Δ2w",
+    "net_cpo_lc_delta_1w":            "Net CPO Δ1w",
+    "net_cpo_lc_delta_2w":            "Net CPO Δ2w",
+    "tenure_days":                    "Tenure (days)",
+    "days_since_last_slot":           "Days since last slot",
+    "is_churned":                     "** CHURNED **",
 }
 
 # ---------------------------------------------------------------------------
@@ -105,10 +114,18 @@ def normalise_week(df: pd.DataFrame, col: str = "week") -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_kpi_rider_week(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate KPI (city/zone/rider/week) -> rider/week by averaging."""
+    """Aggregate KPI (city/zone/rider/week) -> rider/week by averaging, then add WoW trend deltas."""
     available = [c for c in KPI_FEATURE_COLS if c in df.columns]
     df[available] = df[available].apply(pd.to_numeric, errors="coerce")
-    return df.groupby(["rider_id", "week"])[available].mean().reset_index()
+    agg = df.groupby(["rider_id", "week"])[available].mean().reset_index()
+    agg = agg.sort_values(["rider_id", "week"])
+    for col in WOW_TREND_COLS:
+        if col not in agg.columns:
+            continue
+        g = agg.groupby("rider_id")[col]
+        agg[f"{col}_delta_1w"] = agg[col] - g.shift(1)
+        agg[f"{col}_delta_2w"] = agg[col] - g.shift(2)
+    return agg
 
 
 def build_contacts_rider_week(df: pd.DataFrame) -> pd.DataFrame:
