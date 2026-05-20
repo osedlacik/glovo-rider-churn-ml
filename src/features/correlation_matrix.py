@@ -121,7 +121,7 @@ def build_kpi_rider_week(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_contacts_rider_week(df: pd.DataFrame) -> pd.DataFrame:
-    """Pivot flat contacts -> rider/week wide format (top N reasons + total)."""
+    """Pivot flat contacts -> rider-level wide format (top N reasons + total, one row per rider)."""
     df["ticket_count"] = pd.to_numeric(df["ticket_count"], errors="coerce")
 
     top = (
@@ -143,9 +143,33 @@ def build_contacts_rider_week(df: pd.DataFrame) -> pd.DataFrame:
 
     reason_cols = [c for c in pivot.columns if c not in ("rider_id", "week")]
     pivot["total_tickets"] = pivot[reason_cols].sum(axis=1)
-    pivot = pivot.rename(
-        columns={c: f"contact_{c}" for c in reason_cols}
+    pivot = pivot.rename(columns={c: f"contact_{c}" for c in reason_cols})
+
+    # Aggregate to one row per rider (sum across all weeks)
+    all_contact_cols = [c for c in pivot.columns if c not in ("rider_id", "week")]
+    pivot = pivot.groupby("rider_id")[all_contact_cols].sum().reset_index()
+    return pivot
+
+
+def build_compliance_rider(df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot compliance violations to rider-level (one row per rider, one column per violation_type x action_type)."""
+    df = df.copy()
+    df["violations_count"] = pd.to_numeric(df["violations_count"], errors="coerce")
+    df["col"] = (
+        "compliance_"
+        + df["violation_type"].fillna("unknown").str.lower().str.replace(r"\W+", "_", regex=True)
+        + "_"
+        + df["action_type"].fillna("unknown").str.lower().str.replace(r"\W+", "_", regex=True)
     )
+    pivot = (
+        df.groupby(["rider_id", "col"])["violations_count"]
+        .sum()
+        .unstack(fill_value=0)
+        .reset_index()
+    )
+    pivot.columns.name = None
+    comp_cols = [c for c in pivot.columns if c != "rider_id"]
+    pivot["total_violations"] = pivot[comp_cols].sum(axis=1)
     return pivot
 
 
@@ -193,6 +217,7 @@ def _coerce_keys(df: pd.DataFrame) -> pd.DataFrame:
 def merge_all(
     kpi: pd.DataFrame,
     contacts: pd.DataFrame | None,
+    compliance: pd.DataFrame | None,
     churn: pd.DataFrame | None,
     churn_snapshot: bool = False,
 ) -> pd.DataFrame:
@@ -200,6 +225,8 @@ def merge_all(
     merged = _coerce_keys(kpi)
     if contacts is not None and len(contacts):
         merged = merged.merge(_coerce_keys(contacts), on="rider_id", how="left")
+    if compliance is not None and len(compliance):
+        merged = merged.merge(_coerce_keys(compliance), on="rider_id", how="left")
     if churn is not None and len(churn):
         merged = merged.merge(_coerce_keys(churn), on="rider_id", how="left")
     return merged
@@ -223,6 +250,9 @@ def make_label_map(df: pd.DataFrame) -> dict:
         if col.startswith("contact_") and col not in labels:
             reason = col.replace("contact_", "").replace("_", " ").title()
             labels[col] = f"Contact: {reason}"
+        elif col.startswith("compliance_") and col not in labels:
+            readable = col.replace("compliance_", "").replace("_", " ").title()
+            labels[col] = f"Compliance: {readable}"
     return labels
 
 
@@ -267,7 +297,9 @@ def plot_churn_correlation(
 
     cols = [c for c in feature_cols if c != "is_churned"]
     numeric = df[cols + ["is_churned"]].apply(pd.to_numeric, errors="coerce")
-    r = numeric.corr(method="pearson")["is_churned"].drop("is_churned").sort_values()
+    r = numeric.corr(method="pearson")["is_churned"].drop("is_churned")
+    # Sort by absolute correlation so highest-impact features appear at the top
+    r = r.reindex(r.abs().sort_values(ascending=True).index)
 
     display = [labels.get(c, c) for c in r.index]
     colors   = ["#d73027" if v > 0 else "#1a9850" for v in r.values]
@@ -298,6 +330,7 @@ def main() -> None:
     parser.add_argument("--output-dir",      type=str,  default="reports/figures")
     parser.add_argument("--billing-project", type=str,  default=BILLING_PROJECT)
     parser.add_argument("--skip-contacts",    action="store_true")
+    parser.add_argument("--skip-compliance",  action="store_true")
     parser.add_argument("--skip-churn",       action="store_true")
     parser.add_argument("--churn-snapshot",   action="store_true",
                         help="Use fast single-pass churn snapshot instead of full weekly table")
@@ -318,7 +351,13 @@ def main() -> None:
         contacts_raw = normalise_week(contacts_raw)
         contacts = build_contacts_rider_week(contacts_raw)
 
-    # 3. Churn
+    # 3. Compliance
+    compliance = None
+    if not args.skip_compliance:
+        compliance_raw = fetch(load_sql(FEATURES_SQL_DIR / "rider_weekly_compliance.sql", lim), proj, "Compliance")
+        compliance = build_compliance_rider(compliance_raw)
+
+    # 4. Churn
     # NOTE: churn is always fetched WITHOUT a row limit so all rider-weeks/riders
     # are available for joining. Limiting churn to the same N as KPI causes
     # near-zero overlap (different riders/weeks) and blank correlation charts.
@@ -334,8 +373,8 @@ def main() -> None:
             churn_raw = normalise_week(churn_raw, col=week_col)
             churn     = build_churn_rider_week(churn_raw)
 
-    # 4. Merge
-    merged = merge_all(kpi, contacts, churn, churn_snapshot=use_snapshot)
+    # 5. Merge
+    merged = merge_all(kpi, contacts, compliance, churn, churn_snapshot=use_snapshot)
     print(f"Merged: {len(merged):,} rows x {len(merged.columns)} cols")
 
     feature_cols = get_numeric_feature_cols(merged)
@@ -346,10 +385,7 @@ def main() -> None:
 
     out = args.output_dir
 
-    # 5. Full heatmap
-    plot_full_heatmap(corr, labels, f"{out}/correlation_matrix.png")
-
-    # 6. Churn bar chart
+    # 6. Churn bar chart (sorted by |r|, highest impact at top)
     if not args.skip_churn:
         plot_churn_correlation(merged, feature_cols, labels, f"{out}/correlation_to_churn.png")
 

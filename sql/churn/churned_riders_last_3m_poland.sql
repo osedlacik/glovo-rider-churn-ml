@@ -14,7 +14,7 @@ first_delivery AS (
     MIN(DATE(d.rider_dropped_off_at)) AS first_delivery_date
   FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
   UNNEST(o.deliveries) d
-  WHERE o.country_code  = 'gv-ci'
+  WHERE o.country_code  = 'gv-pl'
     AND o.created_date >= DATE('2021-01-01')
     AND d.rider_id IS NOT NULL
     AND d.delivery_status = 'completed'
@@ -30,7 +30,7 @@ deliveries_weekly AS (
     MAX(DATE(d.rider_dropped_off_at))                       AS last_delivery_in_week
   FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
   UNNEST(o.deliveries) d
-  WHERE o.country_code  = 'gv-ci'
+  WHERE o.country_code  = 'gv-pl'
     AND o.created_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 MONTH)
     AND d.rider_id IS NOT NULL
     AND d.delivery_status = 'completed'
@@ -45,7 +45,7 @@ slots_weekly AS (
     DATE_TRUNC(DATE(shift_start_at), WEEK(MONDAY)) AS week,
     MAX(DATE(shift_start_at))                       AS last_slot_in_week
   FROM `fulfillment-dwh-production.curated_data_shared.shifts`
-  WHERE country_code  = 'gv-ci'
+  WHERE country_code  = 'gv-pl'
     AND created_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 MONTH)
     AND rider_id IS NOT NULL
     AND shift_start_at IS NOT NULL

@@ -20,7 +20,7 @@ first_delivery AS (
     MIN(DATE(d.rider_dropped_off_at)) AS first_delivery_date
   FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
   UNNEST(o.deliveries) d
-  WHERE o.country_code  = 'gv-ci'
+  WHERE o.country_code  = 'gv-pl'
     AND o.created_date >= DATE('2021-01-01')
     AND d.rider_id IS NOT NULL
     AND d.delivery_status = 'completed'
@@ -37,7 +37,7 @@ deliveries_weekly AS (
     MAX(DATE(d.rider_dropped_off_at))                       AS last_delivery_in_week
   FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
   UNNEST(o.deliveries) d
-  WHERE o.country_code  = 'gv-ci'
+  WHERE o.country_code  = 'gv-pl'
     AND o.created_date >= DATE('2026-01-01')
     AND d.rider_id IS NOT NULL
     AND d.delivery_status = 'completed'
