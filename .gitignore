@@ -1,0 +1,41 @@
+# Data
+data/*.csv
+data/*.parquet
+data/*.json
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Config secrets
+config/config.yaml
+.env
+*.key
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model artifacts
+models/*.pkl
+models/*.joblib
+models/*.h5

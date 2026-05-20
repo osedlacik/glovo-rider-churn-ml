@@ -1,0 +1,38 @@
+# Copy this to config.yaml and fill in your values
+
+bigquery:
+  project_id: "your-gcp-project"
+  dataset: "supply_ops"
+  credentials_path: "path/to/service-account.json"  # For scheduled runs
+
+churn:
+  # Churn definitions (days without slot booking)
+  threshold_active_days: 14
+  threshold_newbie_days: 7
+  # Newbie = < 30 days since hired
+  newbie_max_tenure_days: 30
+  # Prediction horizon
+  prediction_window_days: 14
+
+model:
+  # Train/test split
+  test_size: 0.2
+  random_state: 42
+  # Models to evaluate
+  algorithms:
+    - xgboost
+    - lightgbm
+    - random_forest
+
+cities:
+  - warsaw
+  - kyiv
+  # Add more cities as needed
+
+slack:
+  webhook_url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+  channel: "#supply-ops-alerts"
+
+dashboard:
+  port: 8501
+  title: "Rider Churn Early Warning System"
