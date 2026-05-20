@@ -12,7 +12,7 @@ WITH Rider_kpis AS (
     SUM(working_time) / 60.00 AS hours_worked,
     1.000 * SUM(rkpi.no_shows) / NULLIF(SUM(rkpi.all_shifts), 0) AS perc_no_show
   FROM `fulfillment-dwh-production.curated_data_shared.rider_kpi` AS rkpi
-  WHERE rkpi.country_code = 'gv-pl'
+  WHERE rkpi.country_code = 'gv-ci'
     AND DATE(created_date_local) >= DATE('2026-01-01')
     AND rkpi.rider_id IS NOT NULL
   GROUP BY 1, 2, 3, 4, 5, 6
@@ -123,7 +123,7 @@ LEFT JOIN Rider_kpis rkpi
  AND rkpi.country_code = o.country_code
  AND rkpi.week = DATE_TRUNC(creation_date_local, WEEK(MONDAY))
 
-WHERE rp.country_code IN ('gv-pl')
+WHERE rp.country_code IN ('gv-ci')
   AND creation_date_local >= DATE('2026-01-01')
 
 GROUP BY 1, 2, 3, 4, 5
