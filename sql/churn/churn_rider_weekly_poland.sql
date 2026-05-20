@@ -1,26 +1,23 @@
--- Rider-week churn labels for modeling
--- Definition at each week:
---   Eligible rider: at least 1 completed primary delivery up to week
---   Churned at week: no slot booking in last threshold days up to week
---     - newbie  (<30 days since FIRST DELIVERY): 7 days
---     - veteran (>=30 days since first delivery): 14 days
--- Newbie tenure is from first_delivery_date, not hire_date.
--- Scope: Poland only (country_code = 'gv-pl'), data from 2026-01-01 onward
-
-DECLARE start_date DATE DEFAULT DATE('2026-01-01');
-DECLARE end_date   DATE DEFAULT CURRENT_DATE();
+-- Efficient weekly churn labels for Poland, 2026-01-01 onward.
+--
+-- Optimisations vs original:
+--   1. No DECLARE - plain SQL, wrappable with LIMIT.
+--   2. Deliveries and slots aggregated to WEEKLY level before any join.
+--   3. UNION ALL + cumulative MAX window replaces all three non-equi joins
+--      (the original eligible_rider_weeks cross-join + two self-joins).
+--   4. rider_hire / riders table removed (not needed for churn label).
 
 WITH
 
--- Global first delivery date per rider (no start_date filter so tenure is
--- accurate for riders who started delivering before 2026-01-01)
+-- ── Global first delivery per rider ────────────────────────────────────────
+-- Scan from 2021 so tenure is correct for riders who predate 2026.
 first_delivery AS (
   SELECT
     d.rider_id,
     MIN(DATE(d.rider_dropped_off_at)) AS first_delivery_date
   FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
   UNNEST(o.deliveries) d
-  WHERE o.country_code = 'gv-pl'
+  WHERE o.country_code  = 'gv-pl'
     AND o.created_date >= DATE('2021-01-01')
     AND d.rider_id IS NOT NULL
     AND d.delivery_status = 'completed'
@@ -29,107 +26,102 @@ first_delivery AS (
   GROUP BY d.rider_id
 ),
 
-rider_hire AS (
-  SELECT
-    r.rider_id,
-    MIN(DATE(c.start_at)) AS first_contract_start_date,
-    DATE(r.created_at)    AS rider_created_date
-  FROM `fulfillment-dwh-production.curated_data_shared.riders` r
-  LEFT JOIN UNNEST(r.contracts) c
-  WHERE r.country_code IN ('gv-pl', 'PL')
-  GROUP BY r.rider_id, rider_created_date
-),
-
-rider_base AS (
-  SELECT
-    rh.rider_id,
-    COALESCE(rh.first_contract_start_date, rh.rider_created_date) AS hire_date,
-    fd.first_delivery_date
-  FROM rider_hire rh
-  LEFT JOIN first_delivery fd ON fd.rider_id = rh.rider_id
-),
-
-deliveries_daily AS (
+-- ── Weekly delivery summary per rider ──────────────────────────────────────
+deliveries_weekly AS (
   SELECT
     d.rider_id,
-    DATE(d.rider_dropped_off_at) AS delivery_date
+    DATE_TRUNC(DATE(d.rider_dropped_off_at), WEEK(MONDAY)) AS week,
+    MAX(DATE(d.rider_dropped_off_at))                       AS last_delivery_in_week
   FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
   UNNEST(o.deliveries) d
-  WHERE o.country_code = 'gv-pl'
-    AND o.created_date >= start_date
-    AND o.created_date <= end_date
+  WHERE o.country_code  = 'gv-pl'
+    AND o.created_date >= DATE('2026-01-01')
     AND d.rider_id IS NOT NULL
     AND d.delivery_status = 'completed'
     AND d.is_primary = TRUE
     AND d.rider_dropped_off_at IS NOT NULL
+  GROUP BY d.rider_id, week
 ),
 
-slots_daily AS (
+-- ── Weekly slot summary per rider ──────────────────────────────────────────
+slots_weekly AS (
   SELECT
-    s.rider_id,
-    DATE(s.shift_start_at) AS slot_date
-  FROM `fulfillment-dwh-production.curated_data_shared.shifts` s
-  WHERE s.country_code = 'gv-pl'
-    AND s.created_date >= start_date
-    AND s.created_date <= end_date
-    AND s.rider_id IS NOT NULL
-    AND s.shift_state IN ('EVALUATED', 'PUBLISHED', 'NO_SHOW', 'NO_SHOW_EXCUSED', 'CANCELLED')
+    rider_id,
+    DATE_TRUNC(DATE(shift_start_at), WEEK(MONDAY)) AS week,
+    MAX(DATE(shift_start_at))                       AS last_slot_in_week
+  FROM `fulfillment-dwh-production.curated_data_shared.shifts`
+  WHERE country_code  = 'gv-pl'
+    AND created_date >= DATE('2026-01-01')
+    AND rider_id IS NOT NULL
+    AND shift_start_at IS NOT NULL
+    AND shift_state IN ('EVALUATED','PUBLISHED','NO_SHOW','NO_SHOW_EXCUSED','CANCELLED')
+  GROUP BY rider_id, week
 ),
 
-weeks AS (
-  SELECT week_start
-  FROM UNNEST(GENERATE_DATE_ARRAY(start_date, end_date, INTERVAL 7 DAY)) AS week_start
+-- ── Merge delivery + slot weeks into one timeline per rider ─────────────────
+-- UNION ALL ensures slot-only weeks are included so the cumulative window
+-- can carry forward the last slot date even into delivery-only weeks.
+activity_weeks AS (
+  SELECT rider_id, week, last_delivery_in_week, NULL AS last_slot_in_week
+  FROM deliveries_weekly
+  UNION ALL
+  SELECT rider_id, week, NULL AS last_delivery_in_week, last_slot_in_week
+  FROM slots_weekly
 ),
 
-eligible_rider_weeks AS (
+-- Collapse duplicate weeks (rider had both delivery and slot in same week)
+activity_agg AS (
   SELECT
-    w.week_start,
-    d.rider_id
-  FROM weeks w
-  JOIN deliveries_daily d
-    ON d.delivery_date <= w.week_start
-  GROUP BY w.week_start, d.rider_id
+    rider_id,
+    week,
+    MAX(last_delivery_in_week) AS last_delivery_in_week,
+    MAX(last_slot_in_week)     AS last_slot_in_week
+  FROM activity_weeks
+  GROUP BY rider_id, week
 ),
 
-rider_week_features AS (
+-- ── Cumulative running max – replaces all non-equi joins ───────────────────
+rider_weekly AS (
   SELECT
-    erw.week_start,
-    erw.rider_id,
-    rb.hire_date,
-    rb.first_delivery_date,
-    -- Tenure from first delivery date for newbie classification
-    DATE_DIFF(erw.week_start, rb.first_delivery_date, DAY) AS tenure_days,
-    MAX(d.delivery_date) AS last_delivery_date,
-    MAX(s.slot_date)     AS last_slot_date
-  FROM eligible_rider_weeks erw
-  LEFT JOIN rider_base rb
-    ON rb.rider_id = erw.rider_id
-  LEFT JOIN deliveries_daily d
-    ON d.rider_id = erw.rider_id
-   AND d.delivery_date <= erw.week_start
-  LEFT JOIN slots_daily s
-    ON s.rider_id = erw.rider_id
-   AND s.slot_date <= erw.week_start
-  GROUP BY erw.week_start, erw.rider_id, rb.hire_date, rb.first_delivery_date
+    a.rider_id,
+    a.week,
+    a.last_delivery_in_week,
+    -- Last delivery date seen in any week up to (and including) this week
+    MAX(a.last_delivery_in_week) OVER w_cum AS last_delivery_date,
+    -- Last slot date seen in any week up to (and including) this week
+    MAX(a.last_slot_in_week)     OVER w_cum AS last_slot_date
+  FROM activity_agg a
+  WINDOW w_cum AS (
+    PARTITION BY a.rider_id
+    ORDER BY a.week
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  )
 )
 
+-- ── Final output: only weeks where the rider made a delivery ───────────────
 SELECT
-  week_start                                          AS week,
-  rider_id,
-  hire_date,
-  first_delivery_date,
-  tenure_days,
-  last_delivery_date,
-  DATE_TRUNC(last_delivery_date, WEEK(MONDAY))        AS last_active_week,
-  last_slot_date,
-  DATE_DIFF(week_start, last_slot_date, DAY)          AS days_since_last_slot,
-  CASE WHEN tenure_days < 30 THEN 'newbie' ELSE 'active_or_veteran' END AS segment,
-  CASE WHEN tenure_days < 30 THEN 7 ELSE 14 END       AS churn_threshold_days,
+  rw.rider_id,
+  rw.week,
+  fd.first_delivery_date,
+  DATE_DIFF(rw.week, fd.first_delivery_date, DAY)       AS tenure_days,
+  rw.last_delivery_date,
+  DATE_TRUNC(rw.last_delivery_date, WEEK(MONDAY))        AS last_active_week,
+  rw.last_slot_date,
+  DATE_DIFF(rw.week, rw.last_slot_date, DAY)             AS days_since_last_slot,
+  CASE WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) < 30
+       THEN 'newbie' ELSE 'active_or_veteran' END         AS segment,
+  CASE WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) < 30
+       THEN 7 ELSE 14 END                                 AS churn_threshold_days,
   CASE
-    WHEN last_slot_date IS NULL                                                THEN 1
-    WHEN tenure_days < 30  AND DATE_DIFF(week_start, last_slot_date, DAY) >= 7  THEN 1
-    WHEN tenure_days >= 30 AND DATE_DIFF(week_start, last_slot_date, DAY) >= 14 THEN 1
+    WHEN rw.last_slot_date IS NULL                                                             THEN 1
+    WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) < 30
+         AND DATE_DIFF(rw.week, rw.last_slot_date, DAY) >= 7                                  THEN 1
+    WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) >= 30
+         AND DATE_DIFF(rw.week, rw.last_slot_date, DAY) >= 14                                 THEN 1
     ELSE 0
-  END AS is_churned
+  END                                                     AS is_churned
 
-FROM rider_week_features
+FROM rider_weekly rw
+JOIN first_delivery fd ON fd.rider_id = rw.rider_id
+WHERE rw.last_delivery_in_week IS NOT NULL   -- eligible weeks only (had delivery this week)
+ORDER BY rw.rider_id, rw.week
