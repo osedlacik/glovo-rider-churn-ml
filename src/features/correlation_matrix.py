@@ -114,18 +114,10 @@ def normalise_week(df: pd.DataFrame, col: str = "week") -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_kpi_rider_week(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate KPI (city/zone/rider/week) -> rider/week by averaging, then add WoW trend deltas."""
+    """Aggregate KPI (city/zone/rider/week) -> one row per rider (mean across all active weeks)."""
     available = [c for c in KPI_FEATURE_COLS if c in df.columns]
     df[available] = df[available].apply(pd.to_numeric, errors="coerce")
-    agg = df.groupby(["rider_id", "week"])[available].mean().reset_index()
-    agg = agg.sort_values(["rider_id", "week"])
-    for col in WOW_TREND_COLS:
-        if col not in agg.columns:
-            continue
-        g = agg.groupby("rider_id")[col]
-        agg[f"{col}_delta_1w"] = agg[col] - g.shift(1)
-        agg[f"{col}_delta_2w"] = agg[col] - g.shift(2)
-    return agg
+    return df.groupby("rider_id")[available].mean().reset_index()
 
 
 def build_contacts_rider_week(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,15 +150,21 @@ def build_contacts_rider_week(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_churn_rider_week(df: pd.DataFrame) -> pd.DataFrame:
-    """Extract churn label columns, normalise week column name."""
+    """Aggregate churn to one row per rider.
+
+    is_churned = 1 if the rider ever churned during the observation window.
+    tenure_days = their average tenure across observed weeks.
+    """
     if "week_start" in df.columns and "week" not in df.columns:
         df = df.rename(columns={"week_start": "week"})
-    keep = [c for c in ["rider_id", "week", "is_churned", "tenure_days"] if c in df.columns]
-    out = df[keep].copy()
     for c in ["is_churned", "tenure_days"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out.drop_duplicates(subset=["rider_id", "week"])
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    agg = df.groupby("rider_id").agg(
+        is_churned=("is_churned", "max"),
+        tenure_days=("tenure_days", "mean"),
+    ).reset_index()
+    return agg
 
 
 def build_churn_snapshot(df: pd.DataFrame) -> pd.DataFrame:
@@ -198,13 +196,12 @@ def merge_all(
     churn: pd.DataFrame | None,
     churn_snapshot: bool = False,
 ) -> pd.DataFrame:
+    # Everything is aggregated to rider level — always merge on rider_id only
     merged = _coerce_keys(kpi)
     if contacts is not None and len(contacts):
-        merged = merged.merge(_coerce_keys(contacts), on=["rider_id", "week"], how="left")
+        merged = merged.merge(_coerce_keys(contacts), on="rider_id", how="left")
     if churn is not None and len(churn):
-        churn_c = _coerce_keys(churn)
-        key = ["rider_id"] if churn_snapshot else ["rider_id", "week"]
-        merged = merged.merge(churn_c, on=key, how="left")
+        merged = merged.merge(_coerce_keys(churn), on="rider_id", how="left")
     return merged
 
 
@@ -248,7 +245,7 @@ def plot_full_heatmap(corr: pd.DataFrame, labels: dict, out_path: str) -> None:
         ax=ax,
     )
     ax.set_title(
-        "Rider Weekly KPI + Contacts + Churn — Pearson Correlation\n(Poland, 2026-01-01+)",
+        "Rider KPI vs Churn — Pearson Correlation (rider-level averages)\n(Poland, 2026-01-01+)",
         fontsize=13, pad=14,
     )
     plt.xticks(rotation=45, ha="right", fontsize=7)
