@@ -75,6 +75,7 @@ BASE_LABELS = {
     "net_cpo_lc_delta_1w":            "Net CPO Δ1w",
     "net_cpo_lc_delta_2w":            "Net CPO Δ2w",
     "tenure_days":                    "Tenure (days)",
+    "weeks_observed":                  "Weeks observed",
     "days_since_last_slot":           "Days since last slot",
     "is_churned":                     "** CHURNED **",
 }
@@ -117,7 +118,13 @@ def build_kpi_rider_week(df: pd.DataFrame) -> pd.DataFrame:
     """Aggregate KPI (city/zone/rider/week) -> one row per rider (mean across all active weeks)."""
     available = [c for c in KPI_FEATURE_COLS if c in df.columns]
     df[available] = df[available].apply(pd.to_numeric, errors="coerce")
-    return df.groupby("rider_id")[available].mean().reset_index()
+    agg = df.groupby("rider_id")[available].mean().reset_index()
+    weeks_obs = (
+        df.groupby("rider_id")["week"].nunique()
+        .reset_index()
+        .rename(columns={"week": "weeks_observed"})
+    )
+    return agg.merge(weeks_obs, on="rider_id", how="left")
 
 
 def build_contacts_rider_week(df: pd.DataFrame) -> pd.DataFrame:
@@ -373,7 +380,28 @@ def main() -> None:
             churn_raw = normalise_week(churn_raw, col=week_col)
             churn     = build_churn_rider_week(churn_raw)
 
-    # 5. Merge
+    # 5. Normalize contacts & compliance by days active (removes tenure bias)
+    if "weeks_observed" in kpi.columns:
+        days_per_rider = kpi[["rider_id", "weeks_observed"]].copy()
+        days_per_rider["rider_id"] = days_per_rider["rider_id"].astype(str)
+        days_per_rider["days_observed"] = (days_per_rider["weeks_observed"] * 7).clip(lower=1)
+
+        def _normalize(df):
+            if df is None or not len(df):
+                return df
+            df = df.copy()
+            df["rider_id"] = df["rider_id"].astype(str)
+            count_cols = [c for c in df.columns if c != "rider_id"]
+            out = df.merge(days_per_rider[["rider_id", "days_observed"]], on="rider_id", how="left")
+            out[count_cols] = out[count_cols].apply(pd.to_numeric, errors="coerce").div(
+                out["days_observed"].fillna(7), axis=0
+            )
+            return out.drop(columns=["days_observed"])
+
+        contacts   = _normalize(contacts)
+        compliance = _normalize(compliance)
+
+    # 6. Merge
     merged = merge_all(kpi, contacts, compliance, churn, churn_snapshot=use_snapshot)
     print(f"Merged: {len(merged):,} rows x {len(merged.columns)} cols")
 
