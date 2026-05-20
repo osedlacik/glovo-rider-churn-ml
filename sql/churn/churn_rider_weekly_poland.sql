@@ -51,18 +51,20 @@ labeled AS (
     dw.rider_id,
     dw.week,
     fd.first_delivery_date,
-    DATE_DIFF(dw.week, fd.first_delivery_date, DAY) AS tenure_days,
+    -- Tenure from actual last delivery date (not week Monday, avoids negatives)
+    DATE_DIFF(dw.last_delivery_in_week, fd.first_delivery_date, DAY) AS tenure_days,
     CASE
-      WHEN DATE_DIFF(dw.week, fd.first_delivery_date, DAY) < 30
+      WHEN DATE_DIFF(dw.last_delivery_in_week, fd.first_delivery_date, DAY) < 30
       THEN 'newbie' ELSE 'active_or_veteran'
     END AS segment,
     dw.last_delivery_in_week,
     -- Next delivery week for this rider (NULL = no future deliveries seen)
     LEAD(dw.week) OVER (PARTITION BY dw.rider_id ORDER BY dw.week) AS next_delivery_week,
-    -- Days until next delivery (NULL if last week in data)
+    -- Gap from actual last delivery date to next delivery date (more precise than Monday-to-Monday)
     DATE_DIFF(
-      LEAD(dw.week) OVER (PARTITION BY dw.rider_id ORDER BY dw.week),
-      dw.week, DAY
+      LEAD(dw.last_delivery_in_week) OVER (PARTITION BY dw.rider_id ORDER BY dw.week),
+      dw.last_delivery_in_week,
+      DAY
     ) AS days_to_next_delivery
   FROM deliveries_weekly dw
   JOIN first_delivery fd ON fd.rider_id = dw.rider_id
@@ -83,10 +85,10 @@ SELECT
     WHEN week >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)              THEN NULL
     -- No future delivery in data window
     WHEN next_delivery_week IS NULL                                       THEN 1
-    -- Newbie gap > 7 days
+    -- Newbie: no delivery within 7 days of last delivery
     WHEN tenure_days < 30  AND days_to_next_delivery > 7                 THEN 1
-    -- Veteran gap > 14 days
-    WHEN tenure_days >= 30 AND days_to_next_delivery > 14                THEN 1
+    -- Veteran: no delivery within 14 days of last delivery
+    WHEN tenure_days >= 30 AND days_to_next_delivery >= 14               THEN 1
     ELSE 0
   END AS is_churned
 
