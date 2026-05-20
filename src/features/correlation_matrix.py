@@ -322,14 +322,17 @@ def main() -> None:
         contacts = build_contacts_rider_week(contacts_raw)
 
     # 3. Churn
+    # NOTE: churn is always fetched WITHOUT a row limit so all rider-weeks/riders
+    # are available for joining. Limiting churn to the same N as KPI causes
+    # near-zero overlap (different riders/weeks) and blank correlation charts.
     churn = None
     use_snapshot = args.churn_snapshot
     if not args.skip_churn:
         if use_snapshot:
-            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_snapshot_current.sql", lim), proj, "Churn (snapshot)")
+            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_snapshot_current.sql"), proj, "Churn (snapshot)")
             churn = build_churn_snapshot(churn_raw)
         else:
-            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_rider_weekly_poland.sql", lim), proj, "Churn (weekly)")
+            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_rider_weekly_poland.sql"), proj, "Churn (weekly)")
             week_col  = "week" if "week" in churn_raw.columns else "week_start"
             churn_raw = normalise_week(churn_raw, col=week_col)
             churn     = build_churn_rider_week(churn_raw)

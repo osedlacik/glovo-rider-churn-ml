@@ -1,16 +1,19 @@
--- Efficient weekly churn labels for Poland, 2026-01-01 onward.
+-- Prospective weekly churn labels for Poland, 2026-01-01 onward.
 --
--- Optimisations vs original:
---   1. No DECLARE - plain SQL, wrappable with LIMIT.
---   2. Deliveries and slots aggregated to WEEKLY level before any join.
---   3. UNION ALL + cumulative MAX window replaces all three non-equi joins
---      (the original eligible_rider_weeks cross-join + two self-joins).
---   4. rider_hire / riders table removed (not needed for churn label).
+-- Churn definition (forward-looking):
+--   A rider is labeled churned at week T if their NEXT delivery is
+--   more than N days away (newbie <30d tenure: N=7, veteran: N=14),
+--   or if they have no future deliveries in the data window.
+--
+--   Weeks within 14 days of CURRENT_DATE are set NULL (right-censored:
+--   not enough future data to observe churn yet).
+--
+-- This definition has real variance and is suitable for ML training.
+-- Scans only the orders table - no shifts join needed.
 
 WITH
 
--- ── Global first delivery per rider ────────────────────────────────────────
--- Scan from 2021 so tenure is correct for riders who predate 2026.
+-- Global first delivery per rider for tenure / newbie classification
 first_delivery AS (
   SELECT
     d.rider_id,
@@ -26,7 +29,7 @@ first_delivery AS (
   GROUP BY d.rider_id
 ),
 
--- ── Weekly delivery summary per rider ──────────────────────────────────────
+-- One row per (rider, week) where rider made at least one delivery
 deliveries_weekly AS (
   SELECT
     d.rider_id,
@@ -43,85 +46,49 @@ deliveries_weekly AS (
   GROUP BY d.rider_id, week
 ),
 
--- ── Weekly slot summary per rider ──────────────────────────────────────────
-slots_weekly AS (
+labeled AS (
   SELECT
-    rider_id,
-    DATE_TRUNC(DATE(shift_start_at), WEEK(MONDAY)) AS week,
-    MAX(DATE(shift_start_at))                       AS last_slot_in_week
-  FROM `fulfillment-dwh-production.curated_data_shared.shifts`
-  WHERE country_code  = 'gv-pl'
-    AND created_date >= DATE('2026-01-01')
-    AND rider_id IS NOT NULL
-    AND shift_start_at IS NOT NULL
-    AND shift_state IN ('EVALUATED','PUBLISHED','NO_SHOW','NO_SHOW_EXCUSED','CANCELLED')
-  GROUP BY rider_id, week
-),
-
--- ── Merge delivery + slot weeks into one timeline per rider ─────────────────
--- UNION ALL ensures slot-only weeks are included so the cumulative window
--- can carry forward the last slot date even into delivery-only weeks.
-activity_weeks AS (
-  SELECT rider_id, week, last_delivery_in_week, NULL AS last_slot_in_week
-  FROM deliveries_weekly
-  UNION ALL
-  SELECT rider_id, week, NULL AS last_delivery_in_week, last_slot_in_week
-  FROM slots_weekly
-),
-
--- Collapse duplicate weeks (rider had both delivery and slot in same week)
-activity_agg AS (
-  SELECT
-    rider_id,
-    week,
-    MAX(last_delivery_in_week) AS last_delivery_in_week,
-    MAX(last_slot_in_week)     AS last_slot_in_week
-  FROM activity_weeks
-  GROUP BY rider_id, week
-),
-
--- ── Cumulative running max – replaces all non-equi joins ───────────────────
-rider_weekly AS (
-  SELECT
-    a.rider_id,
-    a.week,
-    a.last_delivery_in_week,
-    -- Last delivery date seen in any week up to (and including) this week
-    MAX(a.last_delivery_in_week) OVER w_cum AS last_delivery_date,
-    -- Last slot date seen in any week up to (and including) this week
-    MAX(a.last_slot_in_week)     OVER w_cum AS last_slot_date
-  FROM activity_agg a
-  WINDOW w_cum AS (
-    PARTITION BY a.rider_id
-    ORDER BY a.week
-    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-  )
+    dw.rider_id,
+    dw.week,
+    fd.first_delivery_date,
+    DATE_DIFF(dw.week, fd.first_delivery_date, DAY) AS tenure_days,
+    CASE
+      WHEN DATE_DIFF(dw.week, fd.first_delivery_date, DAY) < 30
+      THEN 'newbie' ELSE 'active_or_veteran'
+    END AS segment,
+    dw.last_delivery_in_week,
+    -- Next delivery week for this rider (NULL = no future deliveries seen)
+    LEAD(dw.week) OVER (PARTITION BY dw.rider_id ORDER BY dw.week) AS next_delivery_week,
+    -- Days until next delivery (NULL if last week in data)
+    DATE_DIFF(
+      LEAD(dw.week) OVER (PARTITION BY dw.rider_id ORDER BY dw.week),
+      dw.week, DAY
+    ) AS days_to_next_delivery
+  FROM deliveries_weekly dw
+  JOIN first_delivery fd ON fd.rider_id = dw.rider_id
 )
 
--- ── Final output: only weeks where the rider made a delivery ───────────────
 SELECT
-  rw.rider_id,
-  rw.week,
-  fd.first_delivery_date,
-  DATE_DIFF(rw.week, fd.first_delivery_date, DAY)       AS tenure_days,
-  rw.last_delivery_date,
-  DATE_TRUNC(rw.last_delivery_date, WEEK(MONDAY))        AS last_active_week,
-  rw.last_slot_date,
-  DATE_DIFF(rw.week, rw.last_slot_date, DAY)             AS days_since_last_slot,
-  CASE WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) < 30
-       THEN 'newbie' ELSE 'active_or_veteran' END         AS segment,
-  CASE WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) < 30
-       THEN 7 ELSE 14 END                                 AS churn_threshold_days,
+  rider_id,
+  week,
+  first_delivery_date,
+  tenure_days,
+  segment,
+  last_delivery_in_week,
+  next_delivery_week,
+  days_to_next_delivery,
+  -- Prospective churn label
   CASE
-    WHEN rw.last_slot_date IS NULL                                                             THEN 1
-    WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) < 30
-         AND DATE_DIFF(rw.week, rw.last_slot_date, DAY) >= 7                                  THEN 1
-    WHEN DATE_DIFF(rw.week, fd.first_delivery_date, DAY) >= 30
-         AND DATE_DIFF(rw.week, rw.last_slot_date, DAY) >= 14                                 THEN 1
+    -- Too close to today: future not yet observable
+    WHEN week >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)              THEN NULL
+    -- No future delivery in data window
+    WHEN next_delivery_week IS NULL                                       THEN 1
+    -- Newbie gap > 7 days
+    WHEN tenure_days < 30  AND days_to_next_delivery > 7                 THEN 1
+    -- Veteran gap > 14 days
+    WHEN tenure_days >= 30 AND days_to_next_delivery > 14                THEN 1
     ELSE 0
-  END                                                     AS is_churned
+  END AS is_churned
 
-FROM rider_weekly rw
-JOIN first_delivery fd ON fd.rider_id = rw.rider_id
-WHERE rw.last_delivery_in_week IS NOT NULL   -- eligible weeks only (had delivery this week)
-ORDER BY rw.rider_id, rw.week
+FROM labeled
+ORDER BY rider_id, week
