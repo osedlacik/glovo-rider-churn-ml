@@ -27,22 +27,7 @@
 DECLARE timeframe_start DATE DEFAULT DATE('2026-01-01');
 DECLARE timeframe_end DATE DEFAULT CURRENT_DATE();
 
-WITH first_delivery AS (
-  SELECT
-    CAST(d.rider_id AS STRING) AS rider_id,
-    MIN(DATE(d.rider_dropped_off_at)) AS first_delivery_date
-  FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
-  UNNEST(o.deliveries) d
-  WHERE o.country_code = 'gv-pl'
-    AND o.created_date >= DATE('2021-01-01')
-    AND d.rider_id IS NOT NULL
-    AND d.delivery_status = 'completed'
-    AND d.is_primary = TRUE
-    AND d.rider_dropped_off_at IS NOT NULL
-  GROUP BY d.rider_id
-),
-
-eligible_riders AS (
+WITH eligible_riders AS (
   SELECT DISTINCT CAST(d.rider_id AS STRING) AS rider_id
   FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
   UNNEST(o.deliveries) d
@@ -53,6 +38,14 @@ eligible_riders AS (
     AND d.delivery_status = 'completed'
     AND d.is_primary = TRUE
     AND d.rider_dropped_off_at IS NOT NULL
+),
+
+rider_attrs AS (
+  SELECT
+    CAST(rider_id AS STRING) AS rider_id,
+    DATE(first_order_creation_datetime) AS first_order_date,
+    DATE(last_order_creation_datetime) AS last_order_date
+  FROM `fulfillment-dwh-production.curated_data_shared_glovo.rider_attributes__rider_attributes`
 ),
 
 last_slot AS (
@@ -73,16 +66,16 @@ churned_riders AS (
   SELECT
     er.rider_id,
     CASE
-      WHEN DATE_DIFF(timeframe_end, fd.first_delivery_date, DAY) < 30 THEN 'newbie'
+      WHEN DATE_DIFF(timeframe_end, ra.first_order_date, DAY) < 30 THEN 'newbie'
       ELSE 'active'
     END AS segment,
     CASE
-      WHEN ls.last_slot_date IS NULL THEN DATE_TRUNC(fd.first_delivery_date, WEEK(MONDAY))
+      WHEN ls.last_slot_date IS NULL THEN DATE_TRUNC(ra.first_order_date, WEEK(MONDAY))
       WHEN DATE_DIFF(timeframe_end, ls.last_slot_date, DAY) >= 14 THEN DATE_TRUNC(ls.last_slot_date, WEEK(MONDAY))
       ELSE NULL
     END AS week_of_churn
   FROM eligible_riders er
-  JOIN first_delivery fd ON fd.rider_id = er.rider_id
+  JOIN rider_attrs ra ON ra.rider_id = er.rider_id
   LEFT JOIN last_slot ls ON ls.rider_id = er.rider_id
   WHERE ls.last_slot_date IS NULL
      OR DATE_DIFF(timeframe_end, ls.last_slot_date, DAY) >= 14
@@ -92,13 +85,13 @@ rider_anchor AS (
   SELECT
     er.rider_id,
     CASE
-      WHEN DATE_DIFF(timeframe_end, fd.first_delivery_date, DAY) < 30 THEN 'newbie'
+      WHEN DATE_DIFF(timeframe_end, ra.first_order_date, DAY) < 30 THEN 'newbie'
       ELSE 'active'
     END AS segment,
     c.week_of_churn,
     COALESCE(c.week_of_churn, DATE_TRUNC(timeframe_end, WEEK(MONDAY))) AS anchor_week
   FROM eligible_riders er
-  JOIN first_delivery fd ON fd.rider_id = er.rider_id
+  JOIN rider_attrs ra ON ra.rider_id = er.rider_id
   LEFT JOIN churned_riders c ON c.rider_id = er.rider_id
 ),
 
@@ -111,14 +104,6 @@ rider_weeks AS (
     DATE_SUB(a.anchor_week, INTERVAL wk WEEK) AS feature_week
   FROM rider_anchor a
   CROSS JOIN UNNEST(GENERATE_ARRAY(0, 7)) AS wk
-),
-
-rider_attrs AS (
-  SELECT
-    CAST(rider_id AS STRING) AS rider_id,
-    DATE(first_order_creation_datetime) AS first_order_date,
-    DATE(last_order_creation_datetime) AS last_order_date
-  FROM `fulfillment-dwh-production.curated_data_shared_glovo.rider_attributes__rider_attributes`
 ),
 
 slot_gap_weekly AS (
@@ -134,6 +119,7 @@ slot_gap_weekly AS (
       AND DATE(s.shift_start_at) >= DATE_SUB(timeframe_start, INTERVAL 16 WEEK)
       AND DATE(s.shift_start_at) <= timeframe_end
       AND s.shift_state IN ('EVALUATED', 'PUBLISHED', 'NO_SHOW', 'NO_SHOW_EXCUSED', 'CANCELLED')
+        AND CAST(s.rider_id AS STRING) IN (SELECT rider_id FROM eligible_riders)
   ),
   shifts_with_prev AS (
     SELECT
@@ -171,6 +157,7 @@ rider_kpis_weekly AS (
     AND DATE(rkpi.created_date_local) >= DATE_SUB(timeframe_start, INTERVAL 8 WEEK)
     AND DATE(rkpi.created_date_local) <= timeframe_end
     AND rkpi.rider_id IS NOT NULL
+    AND CAST(rkpi.rider_id AS STRING) IN (SELECT rider_id FROM eligible_riders)
   GROUP BY 1, 2, 6
 ),
 
@@ -270,9 +257,11 @@ weekly_delivery_kpis AS (
   LEFT JOIN `fulfillment-dwh-production.curated_data_shared_glovo.rider_compensations__payments_order_level` rp
     ON CAST(o.global_order_id AS STRING) = CAST(rp.global_order_id AS STRING)
   WHERE rp.country_code = 'gv-pl'
+    AND o.country_code = 'gv-pl'
     AND DATE(o.report_date) >= DATE_SUB(timeframe_start, INTERVAL 8 WEEK)
     AND DATE(o.report_date) <= timeframe_end
     AND o.rider_id IS NOT NULL
+    AND CAST(o.rider_id AS STRING) IN (SELECT rider_id FROM eligible_riders)
   GROUP BY 1, 5
 ),
 
@@ -288,6 +277,7 @@ contacts_weekly AS (
     AND ce.stakeholder_id IS NOT NULL
     AND DATE(ce.creation_timestamp) >= DATE_SUB(timeframe_start, INTERVAL 8 WEEK)
     AND DATE(ce.creation_timestamp) <= timeframe_end
+    AND CAST(ce.stakeholder_id AS STRING) IN (SELECT rider_id FROM eligible_riders)
   GROUP BY 1, 2
 ),
 
@@ -302,8 +292,9 @@ compliance_weekly AS (
   UNNEST(v.actions) a,
   UNNEST(v.rules) r
   WHERE country_code = 'gv-pl'
-    AND DATE(created_at) >= DATE_SUB(timeframe_start, INTERVAL 8 WEEK)
-    AND DATE(created_at) <= timeframe_end
+    AND DATE(created_date) >= DATE_SUB(timeframe_start, INTERVAL 8 WEEK)
+    AND DATE(created_date) <= timeframe_end
+    AND CAST(rider_id AS STRING) IN (SELECT rider_id FROM eligible_riders)
   GROUP BY 1, 2
 ),
 
@@ -377,17 +368,13 @@ holiday_weekly AS (
 newbie_early_features AS (
   WITH first_order AS (
     SELECT
-      CAST(d.rider_id AS STRING) AS rider_id,
-      MIN(DATE(d.rider_dropped_off_at)) AS first_order_date,
-      DATE_TRUNC(MIN(DATE(d.rider_dropped_off_at)), WEEK(MONDAY)) AS first_order_week
-    FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
-    UNNEST(o.deliveries) d
-    WHERE o.country_code = 'gv-pl'
-      AND d.rider_id IS NOT NULL
-      AND d.delivery_status = 'completed'
-      AND d.is_primary = TRUE
-      AND d.rider_dropped_off_at IS NOT NULL
-    GROUP BY 1
+      ra.rider_id,
+      ra.first_order_date,
+      DATE_TRUNC(ra.first_order_date, WEEK(MONDAY)) AS first_order_week
+    FROM rider_attrs ra
+    JOIN rider_anchor a ON a.rider_id = ra.rider_id
+    WHERE a.segment = 'newbie'
+      AND ra.first_order_date IS NOT NULL
   ),
   orders_after_first AS (
     SELECT
@@ -397,6 +384,8 @@ newbie_early_features AS (
     FROM first_order fo
     JOIN `fulfillment-dwh-production.curated_data_shared.orders` o
       ON o.country_code = 'gv-pl'
+     AND o.created_date >= DATE_SUB(timeframe_end, INTERVAL 60 DAY)
+     AND o.created_date <= timeframe_end
     CROSS JOIN UNNEST(o.deliveries) d
     WHERE d.delivery_status = 'completed'
       AND d.is_primary = TRUE
@@ -412,7 +401,7 @@ newbie_early_features AS (
     LEFT JOIN `fulfillment-dwh-production.curated_data_shared.rider_compliance` rc
       ON CAST(rc.rider_id AS STRING) = fo.rider_id
      AND rc.country_code = 'gv-pl'
-     AND DATE(rc.created_at) BETWEEN fo.first_order_date AND DATE_ADD(fo.first_order_date, INTERVAL 29 DAY)
+     AND DATE(rc.created_date) BETWEEN fo.first_order_date AND DATE_ADD(fo.first_order_date, INTERVAL 29 DAY)
     LEFT JOIN UNNEST(rc.violations) v
     GROUP BY 1
   ),

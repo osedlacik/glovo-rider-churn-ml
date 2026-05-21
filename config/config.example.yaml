@@ -47,6 +47,10 @@ phase12:
   threshold_policy_output_path: "reports/phase12_threshold_policy.csv"
   weekly_backtest_output_path: "reports/phase12_weekly_backtest.csv"
   calibration_output_path: "reports/phase12_calibration_table.csv"
+  backtest_model_name: "lightgbm"
+  backtest_time_series_only: true
+  backtest_output_dir: "reports"
+  backtest_output_prefix: "phase12"
 
 cities:
   - warsaw

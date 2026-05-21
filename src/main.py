@@ -14,6 +14,7 @@ from src.data.labeling import label_churn, create_train_test_split
 from src.features.build_features import build_feature_matrix
 from src.models.train import train_models, select_best_model, save_model
 from src.models.train import load_phase12_dataset, load_phase12_forward_dataset, create_time_aware_split
+from src.models.backtest import run_rolling_origin_backtest, save_backtest_artifacts
 from src.models.evaluate import (
     ranking_metrics_at_k,
     threshold_capacity_table,
@@ -202,6 +203,37 @@ def run_phase12_training(config: dict) -> None:
     logger.info("=== PHASE 1/2 TRAINING COMPLETE ===")
 
 
+def run_phase12_backtest(config: dict) -> None:
+    """Rolling-origin temporal validation + drift diagnostics."""
+    logger.info("=== PHASE 1/2 ROLLING BACKTEST ===")
+    pconf = config.get("phase12", {})
+
+    dataset = load_phase12_forward_dataset(
+        features_csv=pconf.get("features_csv", "data/exports/churn_riders_features_8w_poland_2026_to_today.csv"),
+        snapshot_csv=pconf.get("snapshot_csv", "data/exports/churn_riders_snapshot_poland_2026_to_today.csv"),
+        horizon_weeks=int(pconf.get("horizon_weeks", 2)),
+        max_event_offset=int(pconf.get("max_event_offset", 6)),
+    )
+
+    stability_df, drift_df, label_rate_df = run_rolling_origin_backtest(
+        dataset=dataset,
+        date_col=pconf.get("date_col", "event_week"),
+        selection_metric=pconf.get("selection_metric", "avg_precision"),
+        random_state=int(pconf.get("random_state", 42)),
+        model_name=pconf.get("backtest_model_name", "lightgbm"),
+        time_series_only=bool(pconf.get("backtest_time_series_only", True)),
+    )
+
+    save_backtest_artifacts(
+        stability_df=stability_df,
+        drift_df=drift_df,
+        label_rate_df=label_rate_df,
+        out_dir=pconf.get("backtest_output_dir", "reports"),
+        prefix=pconf.get("backtest_output_prefix", "phase12"),
+    )
+    logger.info("=== PHASE 1/2 ROLLING BACKTEST COMPLETE ===")
+
+
 if __name__ == "__main__":
     config = load_config()
 
@@ -210,5 +242,7 @@ if __name__ == "__main__":
         run_training_pipeline(config)
     elif len(sys.argv) > 1 and sys.argv[1] == "train_phase12":
         run_phase12_training(config)
+    elif len(sys.argv) > 1 and sys.argv[1] == "backtest_phase12":
+        run_phase12_backtest(config)
     else:
         run_prediction_pipeline(config)
