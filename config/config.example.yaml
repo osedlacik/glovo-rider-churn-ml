@@ -24,6 +24,24 @@ model:
     - lightgbm
     - random_forest
 
+phase12:
+  # Export-based baseline training inputs
+  features_csv: "data/exports/churn_riders_features_8w_poland_2026_to_today.csv"
+  snapshot_csv: "data/exports/churn_riders_snapshot_poland_2026_to_today.csv"
+
+  # Validation and model selection
+  use_forward_events: true
+  horizon_weeks: 2
+  max_event_offset: 6
+  date_col: "event_week"
+  test_size: 0.2
+  random_state: 42
+  selection_metric: "avg_precision"
+
+  # Artifacts
+  model_output_path: "models/phase12_churn_model.joblib"
+  metrics_output_path: "models/phase12_metrics.json"
+
 cities:
   - warsaw
   - kyiv

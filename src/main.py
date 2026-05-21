@@ -6,11 +6,14 @@ Orchestrates: data extraction → feature engineering → prediction → output.
 
 from loguru import logger
 import yaml
+import json
+from pathlib import Path
 
 from src.data.bq_extract import build_dataset
 from src.data.labeling import label_churn, create_train_test_split
 from src.features.build_features import build_feature_matrix
 from src.models.train import train_models, select_best_model, save_model
+from src.models.train import load_phase12_dataset, load_phase12_forward_dataset, create_time_aware_split
 from src.models.predict import predict_churn, explain_predictions, get_city_summary
 from src.actions.recommendations import recommend_actions
 from src.integrations.slack import send_weekly_alert
@@ -100,11 +103,70 @@ def run_prediction_pipeline(config: dict):
     return all_city_summaries
 
 
+def run_phase12_training(config: dict) -> None:
+    """Phase 1/2 training from exported CSVs with time-aware validation."""
+    logger.info("=== PHASE 1/2 TRAINING ===")
+    pconf = config.get("phase12", {})
+
+    features_csv = pconf.get("features_csv", "data/exports/churn_riders_features_8w_poland_2026_to_today.csv")
+    snapshot_csv = pconf.get("snapshot_csv", "data/exports/churn_riders_snapshot_poland_2026_to_today.csv")
+    model_out = pconf.get("model_output_path", "models/phase12_churn_model.joblib")
+    metrics_out = pconf.get("metrics_output_path", "models/phase12_metrics.json")
+
+    use_forward_events = bool(pconf.get("use_forward_events", True))
+    if use_forward_events:
+        dataset = load_phase12_forward_dataset(
+            features_csv=features_csv,
+            snapshot_csv=snapshot_csv,
+            horizon_weeks=int(pconf.get("horizon_weeks", 2)),
+            max_event_offset=int(pconf.get("max_event_offset", 6)),
+        )
+    else:
+        dataset = load_phase12_dataset(features_csv=features_csv, snapshot_csv=snapshot_csv)
+    logger.info(f"Loaded merged dataset with {len(dataset):,} rows and {len(dataset.columns):,} columns")
+
+    X_train, X_test, y_train, y_test = create_time_aware_split(
+        dataset,
+        date_col=pconf.get("date_col", "event_week" if use_forward_events else "anchor_week"),
+        test_size=float(pconf.get("test_size", 0.2)),
+        random_state=int(pconf.get("random_state", 42)),
+    )
+
+    results = train_models(
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        random_state=int(pconf.get("random_state", 42)),
+    )
+
+    best_name, best_model = select_best_model(results, metric=pconf.get("selection_metric", "avg_precision"))
+    save_model(best_model, model_out)
+
+    summary = {
+        "best_model": best_name,
+        "selection_metric": pconf.get("selection_metric", "avg_precision"),
+        "metrics": {k: v["metrics"] for k, v in results.items()},
+        "train_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "train_positive_rate": float(y_train.mean()),
+        "test_positive_rate": float(y_test.mean()),
+    }
+
+    out = Path(metrics_out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    logger.info(f"Metrics saved to {metrics_out}")
+    logger.info("=== PHASE 1/2 TRAINING COMPLETE ===")
+
+
 if __name__ == "__main__":
     config = load_config()
 
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "train":
         run_training_pipeline(config)
+    elif len(sys.argv) > 1 and sys.argv[1] == "train_phase12":
+        run_phase12_training(config)
     else:
         run_prediction_pipeline(config)

@@ -1,0 +1,22 @@
+{
+  "best_model": "random_forest",
+  "selection_metric": "avg_precision",
+  "metrics": {
+    "logistic_regression": {
+      "roc_auc": 0.7094019511375547,
+      "avg_precision": 0.10271749556410607,
+      "positive_rate_test": 0.04536371854036824,
+      "positive_rate_pred": 0.37535087301964887
+    },
+    "random_forest": {
+      "roc_auc": 0.7732493532553463,
+      "avg_precision": 0.12270641873285282,
+      "positive_rate_test": 0.04536371854036824,
+      "positive_rate_pred": 0.2595984585375137
+    }
+  },
+  "train_rows": 122863,
+  "test_rows": 42038,
+  "train_positive_rate": 0.25040085298259035,
+  "test_positive_rate": 0.04536371854036824
+}
