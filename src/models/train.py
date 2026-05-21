@@ -41,6 +41,13 @@ def _weekly_prefixes(columns: list[str]) -> list[str]:
         match = re.match(r"^(.*)_W([0-7])$", col)
         if match:
             prefix = match.group(1)
+            # Skip already-derived features; only raw weekly measures should be expanded.
+            if (
+                "_delta_" in prefix
+                or "_wow_delta_" in prefix
+                or "_trend_" in prefix
+            ):
+                continue
             idx = int(match.group(2))
             found.setdefault(prefix, set()).add(idx)
     return sorted([k for k, v in found.items() if len(v) >= 2])
