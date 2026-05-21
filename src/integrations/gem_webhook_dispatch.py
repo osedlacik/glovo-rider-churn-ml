@@ -1,5 +1,5 @@
 """
-Webhook payload skeleton for Gemini churn recommendations.
+Webhook payload skeleton for GEM churn recommendations.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ def build_webhook_payload(
     model_name: str,
     model_metrics: dict[str, Any],
     ranking_snapshot: dict[str, Any],
-    gemini_output: dict[str, Any],
+    gem_output: dict[str, Any],
 ) -> dict[str, Any]:
     """Compose the JSON payload sent to downstream ops webhook."""
     return {
@@ -29,7 +29,7 @@ def build_webhook_payload(
             "metrics": model_metrics,
             "ranking_snapshot": ranking_snapshot,
         },
-        "gemini": gemini_output,
+        "gem": gem_output,
     }
 
 

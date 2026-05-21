@@ -28,71 +28,87 @@ Churn program context:
 - Core model outputs:
   - churn_probability (0-1)
   - risk_rank (lower is riskier)
-  - top-K policy (for example top 100, 250, 500, 1000)
-- Important feature families:
-  - earnings dynamics (earnings_per_hour, city-relative earnings gap)
-  - engagement and recency (orders, slots, gap between worked slots)
-  - support/compliance friction (contacts, violations)
-  - seasonality/holiday context
+  - top-decile policy inside country (top 10% highest-risk riders)
+- Category framework for driver explanations:
+  - Earnings Health
+  - Workload and Slot Access
+  - Reliability and Friction
+  - Support and Experience
+  - Momentum and Deterioration
+  - Context and Seasonality
 - Action principles:
   - prefer low-cost, testable actions first
   - map actions to owner: City Ops, Planning, Rider Support, Compliance, Finance
+  - use the provided action-plan sheet rows as operational playbook options
   - avoid unsupported claims; use only provided rider metrics and domain rules
 - Output must be concise and operational, with explicit next steps and expected impact.
 """.strip()
 
 
-def build_gemini_prompt(
-    weekly_batch: list[dict[str, Any]],
+def build_gem_prompt(
+    country_context: dict[str, Any],
+    action_plan_rows: list[dict[str, Any]],
     country_code: str,
-    city_code: str | None = None,
     intervention_capacity: int = 500,
 ) -> str:
-    """Create a single prompt for a weekly action planning run."""
-    city_part = f" city={city_code}," if city_code else ""
+    """Create a single prompt for weekly city-level action planning run."""
 
     return f"""
-You are a rider retention copilot for supply operations.
+You are a supply operations action planner for rider retention.
 
 {churn_knowledge_base()}
 
 Weekly run metadata:
-- country={country_code},{city_part}
+- country={country_code}
 - intervention_capacity={intervention_capacity}
-- records_in_batch={len(weekly_batch)}
+- top_decile_city_count={len(country_context.get('top_3_cities', []))}
 
-Input rider batch (JSON):
-{json.dumps(weekly_batch, ensure_ascii=True)}
+Country-level risk context (JSON):
+{json.dumps(country_context, ensure_ascii=True)}
+
+Action-plan knowledge base rows (JSON):
+{json.dumps(action_plan_rows, ensure_ascii=True)}
 
 Task:
-1) For each rider, infer likely churn drivers from provided metrics.
-2) Recommend up to 3 specific actions with owner and urgency.
-3) Provide a short rationale and confidence.
-4) Return valid JSON only (no markdown) using this schema:
+1) Focus only on the top 3 impacted cities from the provided top-decile portfolio.
+2) For each city, identify dominant churn categories and link them to explicit actions from the action-plan rows.
+3) Prioritize low-cost, high-feasibility actions first, but include medium/high-cost actions when impact is materially higher.
+4) For newbie riders, include a brief GAC-aware note (risk to payback if churn persists).
+5) Return valid JSON only (no markdown) using this schema:
 {{
   "run_summary": {{
     "country": "...",
-    "city": "...",
+    "run_week": "YYYY-MM-DD",
     "capacity": 500,
-    "recommended_interventions": 500,
+    "cities_analyzed": 3,
     "notes": "..."
   }},
-  "riders": [
+  "top_cities": [
     {{
-      "rider_id": "...",
-      "risk": {{"probability": 0.0, "rank": 1}},
-      "drivers": ["...", "...", "..."],
-      "actions": [
-        {{"owner": "City Ops", "action": "...", "urgency": "high|medium|low", "expected_effect": "..."}}
+      "city": "...",
+      "alert_level": "critical|high|medium",
+      "impact_volume": 0,
+      "share_of_country_top_decile": 0.0,
+      "primary_fleet_drivers": ["...", "..."],
+      "recommended_playbook": [
+        {{
+          "impact": "Earnings|Rider Experience|Rider engagement|Fraud",
+          "metric": "...",
+          "action": "...",
+          "estimated_cost": "Low|Medium|High|Unknown",
+          "owner": "City Ops|Planning|Support|Compliance|Finance",
+          "urgency": "high|medium|low"
+        }}
       ],
-      "confidence": "high|medium|low"
+      "newbie_gac_note": "..."
     }}
-  ]
+  ],
+  "execution_notes": ["...", "..."]
 }}
 """.strip()
 
 
-def call_gemini(prompt: str, model: str = "gemini-2.0-flash") -> dict[str, Any]:
+def call_gem(prompt: str, model: str = "gemini-2.0-flash") -> dict[str, Any]:
     """Call Gemini REST API and return parsed JSON response.
 
     This is a skeleton: keep retries, validation, and guardrails in caller logic.
