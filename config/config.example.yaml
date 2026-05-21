@@ -41,6 +41,12 @@ phase12:
   # Artifacts
   model_output_path: "models/phase12_churn_model.joblib"
   metrics_output_path: "models/phase12_metrics.json"
+  ranking_k_values: [100, 250, 500, 1000]
+  calibration_bins: 10
+  ranking_metrics_output_path: "reports/phase12_ranking_metrics.csv"
+  threshold_policy_output_path: "reports/phase12_threshold_policy.csv"
+  weekly_backtest_output_path: "reports/phase12_weekly_backtest.csv"
+  calibration_output_path: "reports/phase12_calibration_table.csv"
 
 cities:
   - warsaw

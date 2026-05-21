@@ -14,6 +14,12 @@ from src.data.labeling import label_churn, create_train_test_split
 from src.features.build_features import build_feature_matrix
 from src.models.train import train_models, select_best_model, save_model
 from src.models.train import load_phase12_dataset, load_phase12_forward_dataset, create_time_aware_split
+from src.models.evaluate import (
+    ranking_metrics_at_k,
+    threshold_capacity_table,
+    weekly_backtest_table,
+    calibration_table,
+)
 from src.models.predict import predict_churn, explain_predictions, get_city_summary
 from src.actions.recommendations import recommend_actions
 from src.integrations.slack import send_weekly_alert
@@ -112,6 +118,11 @@ def run_phase12_training(config: dict) -> None:
     snapshot_csv = pconf.get("snapshot_csv", "data/exports/churn_riders_snapshot_poland_2026_to_today.csv")
     model_out = pconf.get("model_output_path", "models/phase12_churn_model.joblib")
     metrics_out = pconf.get("metrics_output_path", "models/phase12_metrics.json")
+    ranking_out = pconf.get("ranking_metrics_output_path", "reports/phase12_ranking_metrics.csv")
+    threshold_out = pconf.get("threshold_policy_output_path", "reports/phase12_threshold_policy.csv")
+    weekly_backtest_out = pconf.get("weekly_backtest_output_path", "reports/phase12_weekly_backtest.csv")
+    calibration_out = pconf.get("calibration_output_path", "reports/phase12_calibration_table.csv")
+    k_values = [int(k) for k in pconf.get("ranking_k_values", [100, 250, 500, 1000])]
 
     use_forward_events = bool(pconf.get("use_forward_events", True))
     if use_forward_events:
@@ -143,6 +154,32 @@ def run_phase12_training(config: dict) -> None:
     best_name, best_model = select_best_model(results, metric=pconf.get("selection_metric", "avg_precision"))
     save_model(best_model, model_out)
 
+    best_probs = results[best_name]["y_prob"]
+
+    ranking_df = ranking_metrics_at_k(y_test, best_probs, k_values=k_values)
+    threshold_df = threshold_capacity_table(y_test, best_probs)
+    calibration_df = calibration_table(y_test, best_probs, bins=int(pconf.get("calibration_bins", 10)))
+
+    ranking_path = Path(ranking_out)
+    ranking_path.parent.mkdir(parents=True, exist_ok=True)
+    ranking_df.to_csv(ranking_path, index=False)
+
+    threshold_path = Path(threshold_out)
+    threshold_path.parent.mkdir(parents=True, exist_ok=True)
+    threshold_df.to_csv(threshold_path, index=False)
+
+    calibration_path = Path(calibration_out)
+    calibration_path.parent.mkdir(parents=True, exist_ok=True)
+    calibration_df.to_csv(calibration_path, index=False)
+
+    if "event_week" in X_test.columns:
+        weekly_backtest_df = weekly_backtest_table(y_test, best_probs, X_test["event_week"])
+        weekly_path = Path(weekly_backtest_out)
+        weekly_path.parent.mkdir(parents=True, exist_ok=True)
+        weekly_backtest_df.to_csv(weekly_path, index=False)
+    else:
+        weekly_backtest_df = None
+
     summary = {
         "best_model": best_name,
         "selection_metric": pconf.get("selection_metric", "avg_precision"),
@@ -151,6 +188,11 @@ def run_phase12_training(config: dict) -> None:
         "test_rows": int(len(X_test)),
         "train_positive_rate": float(y_train.mean()),
         "test_positive_rate": float(y_test.mean()),
+        "ranking_k_values": k_values,
+        "ranking_metrics_output_path": str(ranking_path),
+        "threshold_policy_output_path": str(threshold_path),
+        "weekly_backtest_output_path": str(weekly_backtest_out) if weekly_backtest_df is not None else None,
+        "calibration_output_path": str(calibration_path),
     }
 
     out = Path(metrics_out)

@@ -17,7 +17,11 @@
 --   at_customer_time_in_minutes, at_vendor_time_in_minutes, cdt, perc_reas,
 --   no_shows, shifts_done, all_shifts, hours_worked,
 --   contacts_total_tickets, avg_sat_score,
---   compliance_total_violations, compliance_distinct_violation_types
+--   compliance_total_violations, compliance_distinct_violation_types,
+--   earnings_per_hour, city_median_earnings_per_hour,
+--   earnings_vs_city_median_abs, earnings_vs_city_median_ratio,
+--   slot_gap_mean_days, slot_gap_max_days,
+--   holiday_days_in_week
 -- =============================================================================
 
 DECLARE timeframe_start DATE DEFAULT DATE('2026-01-01');
@@ -115,6 +119,38 @@ rider_attrs AS (
     DATE(first_order_creation_datetime) AS first_order_date,
     DATE(last_order_creation_datetime) AS last_order_date
   FROM `fulfillment-dwh-production.curated_data_shared_glovo.rider_attributes__rider_attributes`
+),
+
+slot_gap_weekly AS (
+  WITH shifts_clean AS (
+    SELECT
+      CAST(s.rider_id AS STRING) AS rider_id,
+      DATE(s.shift_start_at) AS shift_date,
+      DATE_TRUNC(DATE(s.shift_start_at), WEEK(MONDAY)) AS week
+    FROM `fulfillment-dwh-production.curated_data_shared.shifts` s
+    WHERE s.country_code = 'gv-pl'
+      AND s.rider_id IS NOT NULL
+      AND s.shift_start_at IS NOT NULL
+      AND DATE(s.shift_start_at) >= DATE_SUB(timeframe_start, INTERVAL 16 WEEK)
+      AND DATE(s.shift_start_at) <= timeframe_end
+      AND s.shift_state IN ('EVALUATED', 'PUBLISHED', 'NO_SHOW', 'NO_SHOW_EXCUSED', 'CANCELLED')
+  ),
+  shifts_with_prev AS (
+    SELECT
+      rider_id,
+      week,
+      shift_date,
+      LAG(shift_date) OVER (PARTITION BY rider_id ORDER BY shift_date) AS prev_shift_date
+    FROM shifts_clean
+  )
+  SELECT
+    rider_id,
+    week,
+    AVG(DATE_DIFF(shift_date, prev_shift_date, DAY)) AS slot_gap_mean_days,
+    MAX(DATE_DIFF(shift_date, prev_shift_date, DAY)) AS slot_gap_max_days
+  FROM shifts_with_prev
+  WHERE prev_shift_date IS NOT NULL
+  GROUP BY 1, 2
 ),
 
 rider_kpis_weekly AS (
@@ -274,6 +310,7 @@ compliance_weekly AS (
 applicant_source AS (
   SELECT
     CAST(rider_id AS STRING) AS rider_id,
+    MIN(DATE(created_at)) AS registration_date,
     ARRAY_AGG(
       custom_non_pii_fields.utm.source
       ORDER BY created_at DESC
@@ -281,9 +318,134 @@ applicant_source AS (
     )[SAFE_OFFSET(0)] AS utm_source
   FROM `fulfillment-dwh-production.curated_data_shared.applicants`
   WHERE country_code = 'PL'
-    AND custom_non_pii_fields.utm.source IS NOT NULL
     AND rider_id IS NOT NULL
   GROUP BY rider_id
+),
+
+city_weekly_benchmarks AS (
+  SELECT
+    city_code,
+    week,
+    APPROX_QUANTILES(SAFE_DIVIDE(total_earnings, NULLIF(hours_worked, 0)), 100)[OFFSET(50)] AS city_median_earnings_per_hour,
+    AVG(total_earnings) AS city_avg_total_earnings
+  FROM (
+    SELECT
+      d.city_code,
+      d.week,
+      d.rider_id,
+      d.total_earnings,
+      k.hours_worked
+    FROM weekly_delivery_kpis d
+    LEFT JOIN rider_kpis_weekly k
+      ON k.rider_id = d.rider_id
+     AND k.week = d.week
+    WHERE d.city_code IS NOT NULL
+  )
+  GROUP BY 1, 2
+),
+
+polish_holidays AS (
+  SELECT holiday_date, holiday_name FROM UNNEST([
+    STRUCT(DATE '2025-11-01' AS holiday_date, 'All Saints Day' AS holiday_name),
+    STRUCT(DATE '2025-11-11' AS holiday_date, 'Independence Day' AS holiday_name),
+    STRUCT(DATE '2025-12-25' AS holiday_date, 'Christmas Day' AS holiday_name),
+    STRUCT(DATE '2025-12-26' AS holiday_date, 'Second Day of Christmas' AS holiday_name),
+    STRUCT(DATE '2026-01-01' AS holiday_date, 'New Year Day' AS holiday_name),
+    STRUCT(DATE '2026-01-06' AS holiday_date, 'Epiphany' AS holiday_name),
+    STRUCT(DATE '2026-04-05' AS holiday_date, 'Easter Sunday' AS holiday_name),
+    STRUCT(DATE '2026-04-06' AS holiday_date, 'Easter Monday' AS holiday_name),
+    STRUCT(DATE '2026-05-01' AS holiday_date, 'Labour Day' AS holiday_name),
+    STRUCT(DATE '2026-05-03' AS holiday_date, 'Constitution Day' AS holiday_name),
+    STRUCT(DATE '2026-05-24' AS holiday_date, 'Pentecost' AS holiday_name),
+    STRUCT(DATE '2026-06-04' AS holiday_date, 'Corpus Christi' AS holiday_name),
+    STRUCT(DATE '2026-08-15' AS holiday_date, 'Assumption Day' AS holiday_name),
+    STRUCT(DATE '2026-11-01' AS holiday_date, 'All Saints Day' AS holiday_name),
+    STRUCT(DATE '2026-11-11' AS holiday_date, 'Independence Day' AS holiday_name),
+    STRUCT(DATE '2026-12-25' AS holiday_date, 'Christmas Day' AS holiday_name),
+    STRUCT(DATE '2026-12-26' AS holiday_date, 'Second Day of Christmas' AS holiday_name)
+  ])
+),
+
+holiday_weekly AS (
+  SELECT
+    DATE_TRUNC(holiday_date, WEEK(MONDAY)) AS week,
+    COUNT(*) AS holiday_days_in_week
+  FROM polish_holidays
+  GROUP BY 1
+),
+
+newbie_early_features AS (
+  WITH first_order AS (
+    SELECT
+      CAST(d.rider_id AS STRING) AS rider_id,
+      MIN(DATE(d.rider_dropped_off_at)) AS first_order_date,
+      DATE_TRUNC(MIN(DATE(d.rider_dropped_off_at)), WEEK(MONDAY)) AS first_order_week
+    FROM `fulfillment-dwh-production.curated_data_shared.orders` o,
+    UNNEST(o.deliveries) d
+    WHERE o.country_code = 'gv-pl'
+      AND d.rider_id IS NOT NULL
+      AND d.delivery_status = 'completed'
+      AND d.is_primary = TRUE
+      AND d.rider_dropped_off_at IS NOT NULL
+    GROUP BY 1
+  ),
+  orders_after_first AS (
+    SELECT
+      fo.rider_id,
+      COUNTIF(DATE_DIFF(DATE(d.rider_dropped_off_at), fo.first_order_date, DAY) BETWEEN 0 AND 6) AS orders_first_7d,
+      COUNTIF(DATE_DIFF(DATE(d.rider_dropped_off_at), fo.first_order_date, DAY) BETWEEN 0 AND 29) AS orders_first_30d
+    FROM first_order fo
+    JOIN `fulfillment-dwh-production.curated_data_shared.orders` o
+      ON o.country_code = 'gv-pl'
+    CROSS JOIN UNNEST(o.deliveries) d
+    WHERE d.delivery_status = 'completed'
+      AND d.is_primary = TRUE
+      AND d.rider_dropped_off_at IS NOT NULL
+      AND CAST(d.rider_id AS STRING) = fo.rider_id
+    GROUP BY 1
+  ),
+  compliance_30d AS (
+    SELECT
+      fo.rider_id,
+      COUNT(DISTINCT v.id) AS compliance_events_first_30d
+    FROM first_order fo
+    LEFT JOIN `fulfillment-dwh-production.curated_data_shared.rider_compliance` rc
+      ON CAST(rc.rider_id AS STRING) = fo.rider_id
+     AND rc.country_code = 'gv-pl'
+     AND DATE(rc.created_at) BETWEEN fo.first_order_date AND DATE_ADD(fo.first_order_date, INTERVAL 29 DAY)
+    LEFT JOIN UNNEST(rc.violations) v
+    GROUP BY 1
+  ),
+  first_week_earnings AS (
+    SELECT
+      fo.rider_id,
+      SUM(d.total_earnings) AS first_week_earnings,
+      AVG(cb.city_avg_total_earnings) AS city_avg_earnings_first_week
+    FROM first_order fo
+    LEFT JOIN weekly_delivery_kpis d
+      ON d.rider_id = fo.rider_id
+     AND d.week = fo.first_order_week
+    LEFT JOIN city_weekly_benchmarks cb
+      ON cb.city_code = d.city_code
+     AND cb.week = d.week
+    GROUP BY 1
+  )
+  SELECT
+    fo.rider_id,
+    fo.first_order_date,
+    apl.registration_date,
+    DATE_DIFF(fo.first_order_date, apl.registration_date, DAY) AS days_registration_to_first_order,
+    o.orders_first_7d,
+    o.orders_first_30d,
+    c.compliance_events_first_30d,
+    fwe.first_week_earnings,
+    fwe.city_avg_earnings_first_week,
+    SAFE_DIVIDE(fwe.first_week_earnings, NULLIF(fwe.city_avg_earnings_first_week, 0)) AS first_week_earnings_vs_city_avg_ratio
+  FROM first_order fo
+  LEFT JOIN applicant_source apl ON apl.rider_id = fo.rider_id
+  LEFT JOIN orders_after_first o ON o.rider_id = fo.rider_id
+  LEFT JOIN compliance_30d c ON c.rider_id = fo.rider_id
+  LEFT JOIN first_week_earnings fwe ON fwe.rider_id = fo.rider_id
 ),
 
 weekly_combined AS (
@@ -312,6 +474,7 @@ weekly_combined AS (
     d.at_vendor_time_in_minutes,
     d.cdt,
     d.perc_reas,
+    d.avg_total_distance_google,
 
     k.no_shows,
     k.shifts_done,
@@ -322,7 +485,23 @@ weekly_combined AS (
     c.contacts_total_tickets,
     c.avg_sat_score,
     comp.compliance_total_violations,
-    comp.compliance_distinct_violation_types
+    comp.compliance_distinct_violation_types,
+
+    SAFE_DIVIDE(d.total_earnings, NULLIF(k.hours_worked, 0)) AS earnings_per_hour,
+    cb.city_median_earnings_per_hour,
+    SAFE_DIVIDE(d.total_earnings, NULLIF(k.hours_worked, 0)) - cb.city_median_earnings_per_hour AS earnings_vs_city_median_abs,
+    SAFE_DIVIDE(SAFE_DIVIDE(d.total_earnings, NULLIF(k.hours_worked, 0)), NULLIF(cb.city_median_earnings_per_hour, 0)) AS earnings_vs_city_median_ratio,
+
+    sg.slot_gap_mean_days,
+    sg.slot_gap_max_days,
+    COALESCE(hw.holiday_days_in_week, 0) AS holiday_days_in_week,
+
+    CASE
+      WHEN EXTRACT(MONTH FROM crw.feature_week) IN (12, 1, 2) THEN 'winter'
+      WHEN EXTRACT(MONTH FROM crw.feature_week) IN (3, 4, 5) THEN 'spring'
+      WHEN EXTRACT(MONTH FROM crw.feature_week) IN (6, 7, 8) THEN 'summer'
+      ELSE 'autumn'
+    END AS season_name
 
   FROM rider_weeks crw
   LEFT JOIN weekly_delivery_kpis d
@@ -337,6 +516,14 @@ weekly_combined AS (
   LEFT JOIN compliance_weekly comp
     ON comp.rider_id = crw.rider_id
    AND comp.week = crw.feature_week
+  LEFT JOIN city_weekly_benchmarks cb
+    ON cb.city_code = d.city_code
+   AND cb.week = crw.feature_week
+  LEFT JOIN slot_gap_weekly sg
+    ON sg.rider_id = crw.rider_id
+   AND sg.week = crw.feature_week
+  LEFT JOIN holiday_weekly hw
+    ON hw.week = crw.feature_week
 )
 
 SELECT
@@ -553,6 +740,71 @@ SELECT
   MAX(IF(wc.week_offset = 6, wc.compliance_distinct_violation_types, NULL)) AS compliance_distinct_violation_types_W6,
   MAX(IF(wc.week_offset = 7, wc.compliance_distinct_violation_types, NULL)) AS compliance_distinct_violation_types_W7,
 
+  MAX(IF(wc.week_offset = 0, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W0,
+  MAX(IF(wc.week_offset = 1, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W1,
+  MAX(IF(wc.week_offset = 2, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W2,
+  MAX(IF(wc.week_offset = 3, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W3,
+  MAX(IF(wc.week_offset = 4, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W4,
+  MAX(IF(wc.week_offset = 5, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W5,
+  MAX(IF(wc.week_offset = 6, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W6,
+  MAX(IF(wc.week_offset = 7, wc.earnings_per_hour, NULL)) AS earnings_per_hour_W7,
+
+  MAX(IF(wc.week_offset = 0, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W0,
+  MAX(IF(wc.week_offset = 1, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W1,
+  MAX(IF(wc.week_offset = 2, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W2,
+  MAX(IF(wc.week_offset = 3, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W3,
+  MAX(IF(wc.week_offset = 4, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W4,
+  MAX(IF(wc.week_offset = 5, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W5,
+  MAX(IF(wc.week_offset = 6, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W6,
+  MAX(IF(wc.week_offset = 7, wc.city_median_earnings_per_hour, NULL)) AS city_median_earnings_per_hour_W7,
+
+  MAX(IF(wc.week_offset = 0, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W0,
+  MAX(IF(wc.week_offset = 1, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W1,
+  MAX(IF(wc.week_offset = 2, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W2,
+  MAX(IF(wc.week_offset = 3, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W3,
+  MAX(IF(wc.week_offset = 4, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W4,
+  MAX(IF(wc.week_offset = 5, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W5,
+  MAX(IF(wc.week_offset = 6, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W6,
+  MAX(IF(wc.week_offset = 7, wc.earnings_vs_city_median_abs, NULL)) AS earnings_vs_city_median_abs_W7,
+
+  MAX(IF(wc.week_offset = 0, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W0,
+  MAX(IF(wc.week_offset = 1, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W1,
+  MAX(IF(wc.week_offset = 2, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W2,
+  MAX(IF(wc.week_offset = 3, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W3,
+  MAX(IF(wc.week_offset = 4, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W4,
+  MAX(IF(wc.week_offset = 5, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W5,
+  MAX(IF(wc.week_offset = 6, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W6,
+  MAX(IF(wc.week_offset = 7, wc.earnings_vs_city_median_ratio, NULL)) AS earnings_vs_city_median_ratio_W7,
+
+  MAX(IF(wc.week_offset = 0, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W0,
+  MAX(IF(wc.week_offset = 1, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W1,
+  MAX(IF(wc.week_offset = 2, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W2,
+  MAX(IF(wc.week_offset = 3, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W3,
+  MAX(IF(wc.week_offset = 4, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W4,
+  MAX(IF(wc.week_offset = 5, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W5,
+  MAX(IF(wc.week_offset = 6, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W6,
+  MAX(IF(wc.week_offset = 7, wc.slot_gap_mean_days, NULL)) AS slot_gap_mean_days_W7,
+
+  MAX(IF(wc.week_offset = 0, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W0,
+  MAX(IF(wc.week_offset = 1, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W1,
+  MAX(IF(wc.week_offset = 2, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W2,
+  MAX(IF(wc.week_offset = 3, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W3,
+  MAX(IF(wc.week_offset = 4, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W4,
+  MAX(IF(wc.week_offset = 5, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W5,
+  MAX(IF(wc.week_offset = 6, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W6,
+  MAX(IF(wc.week_offset = 7, wc.slot_gap_max_days, NULL)) AS slot_gap_max_days_W7,
+
+  MAX(IF(wc.week_offset = 0, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W0,
+  MAX(IF(wc.week_offset = 1, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W1,
+  MAX(IF(wc.week_offset = 2, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W2,
+  MAX(IF(wc.week_offset = 3, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W3,
+  MAX(IF(wc.week_offset = 4, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W4,
+  MAX(IF(wc.week_offset = 5, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W5,
+  MAX(IF(wc.week_offset = 6, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W6,
+  MAX(IF(wc.week_offset = 7, wc.holiday_days_in_week, NULL)) AS holiday_days_in_week_W7,
+
+  MAX(IF(wc.week_offset = 0, wc.season_name, NULL)) AS season_name_W0,
+
   -- Evolution features: short-term shift (W0-W1) and full-window shift (W0-W7)
   MAX(IF(wc.week_offset = 0, wc.batch_number, NULL)) - MAX(IF(wc.week_offset = 1, wc.batch_number, NULL)) AS batch_number_delta_W0_W1,
   MAX(IF(wc.week_offset = 0, wc.batch_number, NULL)) - MAX(IF(wc.week_offset = 7, wc.batch_number, NULL)) AS batch_number_delta_W0_W7,
@@ -579,10 +831,118 @@ SELECT
   MAX(IF(wc.week_offset = 0, wc.avg_sat_score, NULL)) - MAX(IF(wc.week_offset = 7, wc.avg_sat_score, NULL)) AS avg_sat_score_delta_W0_W7,
 
   MAX(IF(wc.week_offset = 0, wc.compliance_total_violations, NULL)) - MAX(IF(wc.week_offset = 1, wc.compliance_total_violations, NULL)) AS compliance_total_violations_delta_W0_W1,
-  MAX(IF(wc.week_offset = 0, wc.compliance_total_violations, NULL)) - MAX(IF(wc.week_offset = 7, wc.compliance_total_violations, NULL)) AS compliance_total_violations_delta_W0_W7
+  MAX(IF(wc.week_offset = 0, wc.compliance_total_violations, NULL)) - MAX(IF(wc.week_offset = 7, wc.compliance_total_violations, NULL)) AS compliance_total_violations_delta_W0_W7,
+
+  -- RFM assembly across rolling windows
+  DATE_DIFF(MAX(IF(wc.week_offset = 0, wc.feature_week, NULL)), MAX(ra.last_order_date), DAY) AS r_recency_days_at_anchor,
+  (
+    COALESCE(MAX(IF(wc.week_offset = 0, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 1, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 2, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 3, wc.total_orders_cpo, NULL)), 0)
+  ) AS f_orders_4w,
+  (
+    COALESCE(MAX(IF(wc.week_offset = 0, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 1, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 2, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 3, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 4, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 5, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 6, wc.total_orders_cpo, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 7, wc.total_orders_cpo, NULL)), 0)
+  ) AS f_orders_8w,
+  (
+    COALESCE(MAX(IF(wc.week_offset = 0, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 1, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 2, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 3, wc.total_earnings, NULL)), 0)
+  ) AS m_earnings_4w,
+  (
+    COALESCE(MAX(IF(wc.week_offset = 0, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 1, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 2, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 3, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 4, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 5, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 6, wc.total_earnings, NULL)), 0)
+    + COALESCE(MAX(IF(wc.week_offset = 7, wc.total_earnings, NULL)), 0)
+  ) AS m_earnings_8w,
+
+  SAFE_DIVIDE(
+    (
+      COALESCE(MAX(IF(wc.week_offset = 0, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 1, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 2, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 3, wc.total_earnings, NULL)), 0)
+    ),
+    NULLIF(
+      (
+        COALESCE(MAX(IF(wc.week_offset = 4, wc.total_earnings, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 5, wc.total_earnings, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 6, wc.total_earnings, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 7, wc.total_earnings, NULL)), 0)
+      ),
+      0
+    )
+  ) AS m_earnings_recent4w_vs_prev4w_ratio,
+
+  SAFE_DIVIDE(
+    (
+      COALESCE(MAX(IF(wc.week_offset = 0, wc.total_orders_cpo, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 1, wc.total_orders_cpo, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 2, wc.total_orders_cpo, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 3, wc.total_orders_cpo, NULL)), 0)
+    ),
+    NULLIF(
+      (
+        COALESCE(MAX(IF(wc.week_offset = 4, wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 5, wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 6, wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 7, wc.total_orders_cpo, NULL)), 0)
+      ),
+      0
+    )
+  ) AS f_orders_recent4w_vs_prev4w_ratio,
+
+  -- Fuel/cost proxy from effective distance economics
+  SAFE_DIVIDE(
+    (
+      COALESCE(MAX(IF(wc.week_offset = 0, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 1, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 2, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 3, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 4, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 5, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 6, wc.total_earnings, NULL)), 0)
+      + COALESCE(MAX(IF(wc.week_offset = 7, wc.total_earnings, NULL)), 0)
+    ),
+    NULLIF(
+      (
+        COALESCE(MAX(IF(wc.week_offset = 0, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 1, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 2, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 3, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 4, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 5, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 6, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+        + COALESCE(MAX(IF(wc.week_offset = 7, wc.avg_total_distance_google * wc.total_orders_cpo, NULL)), 0)
+      ),
+      0
+    )
+  ) AS earnings_per_km_8w,
+
+  -- Early lifecycle/newbie predictors
+  MAX(nef.days_registration_to_first_order) AS days_registration_to_first_order,
+  MAX(nef.orders_first_7d) AS orders_first_7d,
+  MAX(nef.orders_first_30d) AS orders_first_30d,
+  MAX(nef.compliance_events_first_30d) AS compliance_events_first_30d,
+  MAX(nef.first_week_earnings) AS first_week_earnings,
+  MAX(nef.city_avg_earnings_first_week) AS city_avg_earnings_first_week,
+  MAX(nef.first_week_earnings_vs_city_avg_ratio) AS first_week_earnings_vs_city_avg_ratio
 
 FROM weekly_combined wc
 LEFT JOIN rider_attrs ra ON ra.rider_id = wc.rider_id
 LEFT JOIN applicant_source apl ON apl.rider_id = wc.rider_id
+LEFT JOIN newbie_early_features nef ON nef.rider_id = wc.rider_id
 GROUP BY wc.rider_id
 ORDER BY wc.rider_id;

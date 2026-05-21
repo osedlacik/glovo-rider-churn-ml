@@ -27,6 +27,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
+try:
+    from xgboost import XGBClassifier
+except Exception:  # pragma: no cover - optional dependency fallback
+    XGBClassifier = None
+
+try:
+    from lightgbm import LGBMClassifier
+except Exception:  # pragma: no cover - optional dependency fallback
+    LGBMClassifier = None
+
 
 def _to_str_id(df: pd.DataFrame, col: str = "rider_id") -> pd.DataFrame:
     out = df.copy()
@@ -57,16 +67,24 @@ def add_wow_trends(df: pd.DataFrame) -> pd.DataFrame:
     """Add week-over-week deltas and 8-week trend slopes for *_W0..*_W7 columns."""
     out = df.copy()
     prefixes = _weekly_prefixes(list(out.columns))
+    new_cols: dict[str, pd.Series | np.ndarray] = {}
 
     for prefix in prefixes:
         week_cols = [f"{prefix}_W{i}" for i in range(8) if f"{prefix}_W{i}" in out.columns]
 
-        # WoW deltas: W0-W1, W1-W2, ... W6-W7
+        # WoW transitions are strictly adjacent-week pairs only (no self-week metrics like W0->W0).
         for i in range(0, 7):
             c0 = f"{prefix}_W{i}"
             c1 = f"{prefix}_W{i+1}"
+            if c0 == c1:
+                continue
             if c0 in out.columns and c1 in out.columns:
-                out[f"{prefix}_wow_delta_W{i}_W{i+1}"] = out[c0] - out[c1]
+                left = pd.to_numeric(out[c0], errors="coerce")
+                right = pd.to_numeric(out[c1], errors="coerce")
+                new_cols[f"{prefix}_wow_delta_W{i}_W{i+1}"] = left - right
+
+                safe_right = right.replace(0, np.nan)
+                new_cols[f"{prefix}_wow_pct_change_W{i}_W{i+1}"] = (left - right) / safe_right
 
         # Trend slope over chronological order W7 -> W0
         if len(week_cols) >= 3:
@@ -80,7 +98,10 @@ def add_wow_trends(df: pd.DataFrame) -> pd.DataFrame:
                 mask = np.isfinite(y)
                 if mask.sum() >= 3:
                     slopes[r] = np.polyfit(x[mask], y[mask], 1)[0]
-            out[f"{prefix}_trend_slope_8w"] = slopes
+            new_cols[f"{prefix}_trend_slope_8w"] = slopes
+
+    if new_cols:
+        out = pd.concat([out, pd.DataFrame(new_cols, index=out.index)], axis=1)
 
     return out
 
@@ -332,7 +353,7 @@ def _build_preprocessor(X: pd.DataFrame) -> ColumnTransformer:
 
 
 def _candidate_models(random_state: int = 42) -> dict[str, Any]:
-    return {
+    models: dict[str, Any] = {
         "logistic_regression": LogisticRegression(
             max_iter=2000,
             class_weight="balanced",
@@ -346,6 +367,39 @@ def _candidate_models(random_state: int = 42) -> dict[str, Any]:
             n_jobs=-1,
         ),
     }
+
+    if XGBClassifier is not None:
+        models["xgboost"] = XGBClassifier(
+            n_estimators=400,
+            learning_rate=0.05,
+            max_depth=6,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_lambda=1.0,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            random_state=random_state,
+            n_jobs=-1,
+        )
+    else:
+        logger.warning("xgboost not available; skipping xgboost candidate")
+
+    if LGBMClassifier is not None:
+        models["lightgbm"] = LGBMClassifier(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=31,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=random_state,
+            n_jobs=-1,
+            class_weight="balanced",
+            verbose=-1,
+        )
+    else:
+        logger.warning("lightgbm not available; skipping lightgbm candidate")
+
+    return models
 
 
 def train_models(
