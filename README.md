@@ -42,6 +42,11 @@ We cannot predict which couriers are about to leave until they already have. Thi
 2. **Dashboard** with detailed metrics, ranked rider list, churn probability, reasons
 3. **Rider-level predictions**: ID, churn probability, top contributing signals, recommended intervention
 
+## Canonical Churn SQL (Poland)
+
+- `sql/churn/churn_riders_snapshot_poland.sql`: canonical rider-level churn snapshot query.
+- `sql/churn/churn_riders_snapshot_count_poland.sql`: churned rider count, using the exact same snapshot logic.
+
 ## Quick Start
 
 ```bash

@@ -340,7 +340,7 @@ def main() -> None:
     parser.add_argument("--skip-compliance",  action="store_true")
     parser.add_argument("--skip-churn",       action="store_true")
     parser.add_argument("--churn-snapshot",   action="store_true",
-                        help="Use fast single-pass churn snapshot instead of full weekly table")
+                        help="Use rider-level churn snapshot query")
     args = parser.parse_args()
 
     proj = args.billing_project
@@ -372,12 +372,10 @@ def main() -> None:
     use_snapshot = args.churn_snapshot
     if not args.skip_churn:
         if use_snapshot:
-            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_snapshot_current.sql"), proj, "Churn (snapshot)")
+            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_riders_snapshot_poland.sql"), proj, "Churn (snapshot)")
             churn = build_churn_snapshot(churn_raw)
         else:
-            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_rider_weekly_poland.sql"), proj, "Churn (weekly)")
-            week_col  = "week" if "week" in churn_raw.columns else "week_start"
-            churn_raw = normalise_week(churn_raw, col=week_col)
+            churn_raw = fetch(load_sql(CHURN_SQL_DIR / "churn_riders_snapshot_poland.sql"), proj, "Churn")
             churn     = build_churn_rider_week(churn_raw)
 
     # 5. Normalize contacts & compliance by days active (removes tenure bias)
